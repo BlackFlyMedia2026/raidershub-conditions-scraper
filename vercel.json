@@ -1,7 +1,7 @@
 {
   "crons": [
     {
-      "path": "/api/scrape-conditions",
+      "path": "/api/update-live-data",
       "schedule": "*/10 * * * *"
     }
   ]
