@@ -1,57 +1,97 @@
+// api/update-live-data.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { initializeApp, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { createClient } from '@supabase/supabase-js';
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
-if (!serviceAccount.private_key) {
-  throw new Error('FIREBASE_SERVICE_ACCOUNT not set');
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error('Missing Supabase URL or Anon Key');
 }
 
-initializeApp({
-  credential: cert(serviceAccount)
-});
-
-const db = getFirestore();
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    // Hier die echte Quelle scrapen (Beispiel mit metaforge – passe später an)
-    const response = await fetch('https://metaforge.app/arc-raiders/event-timers');
-    const data = await response.json();
+    // 1. Steam-Spielerzahl scrapen
+    const steamRes = await fetch('https://steamplayerstats.com/games/arc-raiders');
+    const steamText = await steamRes.text();
 
-    // Beispiel: Parse die Conditions (anpassen an echte Struktur)
-    const conditions = data?.conditions || []; // z. B. [{name: "COLD SNAP", map: "Buried City", endsAt: "2026-02-24T18:00:00Z"}]
+    // Einfache Regex – passe an, wenn die Seite sich ändert
+    const match = steamText.match(/Current Players<\/span>:\s*([\d,]+)/i);
+    const steamPlayers = match ? parseInt(match[1].replace(/,/g, '')) : 0;
 
-    const batch = db.batch();
+    const estimatedTotal = Math.round(steamPlayers * 2 / 1000) * 1000;
 
-    // Current
-    if (conditions[0]) {
-      batch.set(db.collection('live_conditions').doc('current'), {
-        ...conditions[0],
-        updatedAt: new Date().toISOString()
-      });
+    // 2. Conditions scrapen (Beispiel metaforge – passe Selector/URL an, wenn nötig)
+    const conditionsRes = await fetch('https://metaforge.app/arc-raiders/event-timers');
+    const conditionsData = await conditionsRes.json();
+
+    // Annahme: data ist Array von Events
+    const conditions = conditionsData?.events || [];
+
+    // 3. In Supabase schreiben
+    const batch = [];
+
+    // Spielerzahl
+    batch.push(
+      supabase.from('live_stats').upsert({
+        id: 'players',
+        total_estimated: estimatedTotal,
+        steam_current: steamPlayers,
+        last_updated: new Date().toISOString()
+      })
+    );
+
+    // Conditions (max 3)
+    if (conditions.length > 0) {
+      batch.push(
+        supabase.from('live_conditions').upsert({
+          id: 'current',
+          name: conditions[0]?.name || '',
+          map: conditions[0]?.map || '',
+          effect: conditions[0]?.effect || '',
+          loot: conditions[0]?.loot || 0,
+          pvp: conditions[0]?.pvp || 0,
+          danger: conditions[0]?.danger || 0,
+          tip: conditions[0]?.tip || '',
+          ends_at: conditions[0]?.endsAt || null,
+          updated_at: new Date().toISOString()
+        })
+      );
     }
 
-    // Next 2
-    if (conditions[1]) {
-      batch.set(db.collection('live_conditions').doc('next1'), {
-        ...conditions[1],
-        updatedAt: new Date().toISOString()
-      });
-    }
-    if (conditions[2]) {
-      batch.set(db.collection('live_conditions').doc('next2'), {
-        ...conditions[2],
-        updatedAt: new Date().toISOString()
-      });
+    if (conditions.length > 1) {
+      batch.push(
+        supabase.from('live_conditions').upsert({
+          id: 'next1',
+          ...conditions[1],
+          updated_at: new Date().toISOString()
+        })
+      );
     }
 
-    await batch.commit();
+    if (conditions.length > 2) {
+      batch.push(
+        supabase.from('live_conditions').upsert({
+          id: 'next2',
+          ...conditions[2],
+          updated_at: new Date().toISOString()
+        })
+      );
+    }
 
-    res.status(200).json({ success: true, updated: conditions.length });
+    // Ausführen
+    await Promise.all(batch);
+
+    res.status(200).json({
+      success: true,
+      steam_players: steamPlayers,
+      estimated_total: estimatedTotal,
+      conditions_count: conditions.length
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Scraping failed' });
+    res.status(500).json({ error: 'Scraper failed', details: error.message });
   }
 }
